@@ -1,0 +1,302 @@
+---
+title: "gwide_random_forest_implementation"
+author: "Weihan Liu"
+date: "17/02/2020"
+output: html_document
+---
+
+##Install relevant packages
+```{r,results='hide'}
+library(randomForest)  #ML
+library(caret)  #ML
+library(ggplot2) #plotting
+library(dplyr) #data manipulation
+library(tibble) #data manipulation
+library(stats) #data manipulation
+```
+
+
+##Read in files
+```{r}
+aml_gwide_knn <- read_csv("/Users/weihan/Desktop/Research/machine_learning_platform/essential_genes/chr7_essential_genes/data/aml_gwide_knn.csv") 
+
+aml_gwide_knn <- select(aml_gwide_knn,-"X1")
+```
+
+
+
+We will use the Cancer gene census labeled oncogene as our ground truth column
+
+Read in the complete CGC database and do some cleaning
+```{r}
+CGC_all <- read.csv("/Users/weihan/Desktop/Research/machine_learning_platform/essential_genes/chr7_essential_genes/data/CGC_complete_data.csv",stringsAsFactors = FALSE)
+glimpse(CGC_all)
+```
+
+```{r}
+#retain useful columns
+CGC_all <- select(CGC_all,c("Gene.Symbol","Tumour.Types.Somatic.","Role.in.Cancer"))
+CGC_all <- dplyr::rename(CGC_all,
+                         Gene = Gene.Symbol,
+                         cancer_type = Tumour.Types.Somatic.,
+                         Role = Role.in.Cancer)
+#only retain oncogenes, there are 215 CGC labeled oncogenes, we select out the genes that only have oncogene annotation and no tumor suppressor annotation
+CGC_oncogene <- CGC_all[grepl("oncogene",CGC_all$Role) & !grepl("TSG",CGC_all$Role),]
+
+#further filter out only oncogenes implicated in AML, there are 43 CGC labeled AML oncogenes 
+CGC_AML_oncogene <- CGC_oncogene[grepl("AML",CGC_oncogene$cancer_type),]
+
+```
+Attach the ground truth column to the data
+```{r}
+#' @data: the dataframe contain your complete data
+#' @truth_df: the dataframe contains the oncogene information from CGC
+attach_truth <- function(data,truth_df){
+  truth_df <- mutate(truth_df,status = 1)
+  data <- left_join(data,select(truth_df,c("Gene","status")), by = "Gene")
+  return(data)
+}
+```
+
+
+```{r}
+aml_gwide_knn <- attach_truth(aml_gwide_knn,CGC_oncogene)
+aml_gwide_knn <- as.data.frame(aml_gwide_knn)
+#replace the NA in the onco_status with 0
+aml_gwide_knn$status[is.na(aml_gwide_knn$status)] <- 0
+#sanitycheck the genes that are labeled as oncogene, make sure there's no apparent TSG
+aml_gwide_knn[aml_gwide_knn$status == 1,]
+```
+
+##Split the training vs testing data
+create training data, which is all of the non-chromosome 7 genes. The training data is unbalanced, majority of genes are non CGC labeled TS, so their TS status = 0
+```{r}
+#generate training data
+aml_gwide_train <- aml_gwide_knn %>%
+        filter(chromosome != "chr7")
+#there are 27 oncogenes in training data and 16928 genes in total, so the ratio of oncogene:total # of genes is
+onco_ratio <- 211/16928
+```
+
+```{r}
+#generate testing data
+aml_gwide_test <- aml_gwide_knn %>%
+        filter(chromosome == "chr7") %>%
+        select(-"chromosome") %>%
+        column_to_rownames(var = "Gene")
+aml_gwide_test$status <- as.factor(aml_gwide_test$statu)
+str(aml_gwide_test)
+```
+
+Balance the training data set by sampling non-TS from the training data set using bootstrapping
+```{r}
+set.seed(69698)
+#' @train_data: your training data
+#' @ratio: ratio of genes labeled as 1, (in this case oncogene) to the total number of genes in training data
+#function to generate the balanced training data
+# input is the unbalanced unsampled training data
+train_data_generate <- function(train_data,ratio){
+
+        gwide_train_balance_CGC <- filter(train_data,status == 0) %>% 
+                                grouped_df("chromosome") %>%
+                                sample_frac(size = ratio)
+                        
+        gwide_train_balance_CGC <- as.data.frame(gwide_train_balance_CGC)
+        gwide_train_balance_CGC <- rbind(gwide_train_balance_CGC,filter(train_data,status == 1))
+        gwide_train_balance_CGC$status <- as.factor(gwide_train_balance_CGC$status)
+        gwide_train_balance_CGC <- column_to_rownames(gwide_train_balance_CGC,var = "Gene")
+        
+        return(gwide_train_balance_CGC)
+}
+
+
+#run the function 100 times and store the resulted training data in a list
+balanced_train_list  <- lapply(seq_len(100),function(x) train_data_generate(aml_gwide_train,onco_ratio))
+```
+
+
+training data list: balanced_train_list
+testing data: gwide_test_CGC
+
+##Hyperparameter tuning
+We will use a grid search based method to exhaustively search for the best combination hyperparameters, which will give the smallest OOB error
+```{r}
+set.seed(6786)
+#' @ntree: number of trees, default is 500
+#' @mtry: number of variables randomly sampled as candidates at each split
+#' @samplesize: number of samples(rows) to train on, default = 63.2%
+#' @nodesize: minimum size(# of samples) pf the terminal nodes, if small, allows deeper and more complex tree
+#' @maxnodes: maximum number of terminal nodes
+
+#grid search
+#Establish a list of possible values for mtry, nodesize and sampsize
+mtry <- seq(4, ncol(balanced_train_list[[1]]) * 0.8, 2)
+nodesize <- seq(3, 10, 2)
+sampsize <- nrow(balanced_train_list[[1]]) * c(0.7,0.8)
+#create an empty holder dataframe to hold all the hyperparatmeters creates for each boostrap
+
+best_hyper_all <- data.frame()
+
+hyper_parameter_tune <- function(train_data,mtry,nodesize,sampsize){
+        for (k in 1:length(train_data)){
+                # Create a data frame containing all combinations 
+                hyper_grid <- expand.grid(mtry = mtry, nodesize = nodesize, sampsize = sampsize)
+                # Create an empty vector to store OOB error values
+                oob_err <- c()
+                
+                # Write a loop over the rows of hyper_grid to train the grid of models
+                for (i in 1:nrow(hyper_grid)) {
+                
+                    # Train a Random Forest model
+                    rf_model <- randomForest(formula = status ~ ., 
+                                          data = select(train_data[[k]],-c("chromosome")),
+                                          mtry = hyper_grid$mtry[i],
+                                          nodesize = hyper_grid$nodesize[i],
+                                          sampsize = hyper_grid$sampsize[i])
+                                          
+                    # Store OOB error for the model                      
+                    oob_err[i] <- rf_model$err.rate[nrow(rf_model$err.rate), "OOB"]
+                }
+        
+                # Identify optimal set of hyperparmeters based on OOB error
+                opt_i <- which.min(oob_err)
+                best_hyper <- hyper_grid[opt_i,]
+                best_hyper_all <- rbind(best_hyper_all,best_hyper) 
+        }
+       return(best_hyper_all)        
+}  
+
+best_hyper_all <- hyper_parameter_tune(balanced_train_list,mtry,nodesize,sampsize) 
+ 
+```
+
+
+## fit of random forest model using the optimal hyperparameters
+```{r}
+set.seed(2245646)
+#' @train_data_list: list of randomly sampled training data
+#' @hyperparameter_grid: a dataframe of hyperparameteers corresponding to your training data list. Each training data in the list has a corresponding combination of hyperparameters
+
+
+run_class_rf <- function(train_data_list,hyperparameter_grid) {
+        rf_list <- vector(mode = "list",length = length(balanced_train_list)) #empty holder list to hold all the rf model 
+        for (i in 1:length(train_data_list)) {
+                rf = randomForest(status ~ .,
+                                  data = select(train_data_list[[i]],
+                                   -"chromosome"),
+                                  importance = TRUE,
+                                  mtry = hyperparameter_grid[i,1],
+                                  nodesize = hyperparameter_grid[i,2],
+                                  sampsize = floor(hyperparameter_grid[i,3])) # it's mandatory you round the sample size here to an integer, otherwise the predict() code will break
+                                  rf_list[[i]] <- rf
+        }
+        return(rf_list)
+}
+
+class_rf_list <- run_class_rf(balanced_train_list,best_hyper_all)
+```
+
+Examine overall OOB rate
+```{r}
+set.seed(8976969)
+#' @rf_list: list containing all rf models
+mean_OOB <- function(rf_list) {
+        OOB_list <- numeric(length = length(rf_list)) #empty holder vector to hold all the OOBs
+        for (i in 1:length(rf_list)){
+            err <- as.data.frame(rf_list[[i]]$err.rate) 
+            OOB <- mean(err$OOB) #mean OOB for each model
+            OOB_list[[i]] <- OOB
+        }
+        return(OOB_list)
+}
+
+mean_OOB_list <- mean_OOB(class_rf_list) #OOB values for all classification RF models
+mean(mean_OOB_list) #average of all OOB values
+boxplot(mean_OOB_list)#visualize distribution of OOB values 
+
+ #print(rf1) #use this print out individual RF model 
+ #varImpPlot(rf1) #use this to plot the importance for predictor columns
+```
+
+
+
+
+##Predict the test set
+```{r}
+set.seed(57835678)
+#' @rf_list: list of random forest models from bootstrapping
+class_rf_pred <- function(rf_list, test_data){
+        for (i in 1:length(rf_list)){
+                test_data <- cbind(test_data,predict(object = rf_list[[i]],newdata = test_data,type = "class")) #attach all the prediction results for every bootstrapp to the test data
+        } 
+        return(test_data)
+}
+gwide_test_CGC_new <- class_rf_pred(class_rf_list,gwide_test_CGC)
+
+```
+
+Rank the genes based on the frequency of being predicted as TS(1)
+```{r}
+#convert all prediction result columns to numeric, for addition
+for (i in 34:133) {
+        gwide_test_CGC_new[,i] <- as.numeric(gwide_test_CGC_new[,i])
+        
+}
+
+#add all prediction result for all bootstrapped samples, and store this summation in a columns
+gwide_test_CGC_new$hits_total <- rowSums(gwide_test_CGC_new[,34:133]) 
+
+rf_class_result <- as.data.frame(rowSums(gwide_test_CGC_new[,34:133])) 
+colnames(rf_class_result) = "TS_freq"
+rf_class_result <- rownames_to_column(rf_class_result,var = "Gene")
+rf_class_result <- rf_class_result[order(rf_class_result$TS_freq,decreasing = TRUE),]
+rf_class_result #this is the list of TSs, ranked by their total frquency, predicted by a bootstrapped sampling(100 times) of classification random forest
+
+#export the predicted hits
+write.csv(rf_class_result, "/Users/weihan/Documents/GitHub/ts_machine_learning/data/gwide_hema_classification/pred_hits_CGC_bootstrap.csv")
+```
+
+
+Examine overlaps
+```{r}
+#overlapping between CGC labeled TS and the predicted TS
+high_conf_hits <- as.data.frame(rf_class_result$Gene[1:110][rf_class_result$Gene[1:110] %in% CGC_TS$Gene])
+high_conf_hits
+
+#overlapping between Jeremy's 96 genes with the predicted TS
+jeremy_genes_overlap <- as.data.frame(rf_class_result$Gene[1:110][rf_class_result$Gene[1:110] %in% jeremy_genes$Gene])
+jeremy_genes_overlap
+#29 overlaps
+
+#import the predicted result using only one sampling(no bootstrapping)
+pred_gene <- read.csv("/Users/weihan/Documents/GitHub/ts_machine_learning/data/gwide_hema_classification/pred_hits_CGC.csv",stringsAsFactors = FALSE)
+
+as.data.frame(rf_class_result$Gene[1:110][rf_class_result$Gene[1:110] %in% pred_gene$Gene])
+```
+
+
+plot the ROC curve
+```{r}
+library(pROC)
+pROC_obj <- roc(as.numeric(gwide_test_CGC$TS_status),as.numeric(gwide_test_CGC$hits),
+            smoothed = TRUE,
+            # arguments for ci
+            ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+            # arguments for plot
+            plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+            print.auc=TRUE, show.thres=TRUE)
+
+sens.ci <- ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue")
+## Warning in plot.ci.se(sens.ci, type = "shape", col = "lightblue"): Low
+## definition shape.
+plot(sens.ci, type="bars")
+
+
+```
+
+
+
+
+
+

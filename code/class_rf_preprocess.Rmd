@@ -1,0 +1,107 @@
+---
+title: "data preprocessing for machine learning"
+author: "Weihan Liu"
+date: "12/02/2020"
+output: html_document
+---
+
+data preprocessing for machine learning prediction of essential genes
+
+load required libraries
+```{r}
+library(tidyselect)
+library(data.table)
+```
+
+read in the data file. There are genome wide KD/KO screens compiled from public data sources
+```{r}
+aml.gwide <- read.csv("/Users/weihan/Desktop/Research/machine_learning_platform/essential_genes/chr7_essential_genes/data/aml_all_genes.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+#check there's no duplicated genes
+duplicated(aml.gwide$sorted_gene_symbol) %>% sum()
+#rename gene column
+aml.gwide <- dplyr::rename(aml.gwide,Gene = sorted_gene_symbol)
+str(aml.gwide)
+```
+
+Then we do some filtering of the predictor columns:
+
+1)Filter out columns with too many NA
+```{r}
+#rank NA percentage by column
+sapply(aml.gwide, function(x) sum(is.na(x))/length(x)) %>% 
+        sort(decreasing = TRUE) 
+```
+All of the columns have less than 5% NA, which is very few, so we don't need to get rid of any columns
+
+
+2)Filter out columns with too many 0
+```{r}
+#0 values
+sapply(aml.gwide, function(x) sum(x == 0,na.rm = TRUE)/length(x)) %>%
+        sort(decreasing = TRUE)
+```
+All of the columns have very few 0s, so we retain all columns
+
+
+optional, we haven't done this yet
+----------------
+add Elledge 2013 data columns to enrich training data
+```{r}
+library(readxl)
+elledge <- read_xlsx("/Users/weihan/Documents/GitHub/ts_machine_learning/data/gwide_hema_classification/elledge2013supplement.xlsx")
+elledge <- elledge %>% select(c("Gene","LOF/Silent*","Splicing/Benign*","MissDamaging/Benign*"))
+
+gwide <- full_join(gwide, elledge, by = "Gene")
+
+gwide <- gwide %>% rename(LOF_Silent = `LOF/Silent*`,
+                          Splicing_Benign = `Splicing/Benign*`,
+                          MissDamaging_Benign = `MissDamaging/Benign*`)
+glimpse(gwide)
+```
+-----------------
+
+
+##knn imputation
+```{r}
+library(data.table)
+library(impute)
+```
+
+```{r}
+str(aml.gwide)
+```
+
+Perform KNN imputation
+```{r}
+#select out the gene and chromosome columnes, these will not be used in knn imputation, we need to attach them back to the imputed dataframe later
+gene_chr = select(aml.gwide,c("Gene","chromosome"))
+aml.gwide <- column_to_rownames(aml.gwide,var = "Gene")
+```
+
+```{r}
+aml_gwide_knn <- impute.knn(as.matrix(select(aml.gwide,-"chromosome")),k = 10, rowmax = 1, colmax = 1, maxp = 1500, rng.seed=679676)
+
+#confirm there is no longer missing values
+anyNA(aml_gwide_knn)
+
+#impute.knn returns a object, we need to extract the data from it
+aml_gwide_knn <- as.data.frame(aml_gwide_knn$data)
+
+#attach back the gene and chromosome columns
+aml_gwide_knn <- aml_gwide_knn %>% rownames_to_column(var = "Gene") %>%
+        inner_join(gene_chr, by = "Gene") 
+
+glimpse(aml_gwide_knn)
+
+#save the knn_imputated file 
+write.csv(aml_gwide_knn,"/Users/weihan/Desktop/Research/machine_learning_platform/essential_genes/chr7_essential_genes/data/aml_gwide_knn.csv")
+```
+
+
+
+
+
+
